@@ -1,16 +1,6 @@
 # phase-loop
 
-**Run a long plan phase by phase, with no one watching.**
-
-A big plan is too much for one agent session. The context fills up and the model loses track. So you split the plan into phases and do one per session: start a new session, paste in the next phase, wait, check the work, commit, and do it again. That's slow, and someone has to sit there the whole time.
-
-phase-loop does those steps for you with **Oh My Pi**. Point it at your `plan.md` and it gives each phase its own fresh `omp -p` session. After each phase it runs your verify commands (typecheck, tests). If they fail, it opens a new session with the errors so the agent can fix them. When they pass, it commits and moves on to the next phase. Notes are carried from one phase to the next in `.loop/HANDOFF.md`, so each session knows what the earlier ones did.
-
-It runs in the background, so you can close omp or the terminal and it keeps going. Follow it from a live `/phase-loop` panel in omp or with `phase-loop watch`, and get phone alerts through ntfy when the run finishes, fails, or needs a human.
-
-```
-/phase-loop start @specs/plan.md --from 1 --to 8
-```
+Run a multi-phase plan with **Oh My Pi**, unattended: every phase gets a **fresh `omp -p` session** (your manual "/clear, then do the next task"), the runner checks the work itself, commits, and moves on. It runs as a background process, so it keeps going after you close omp or the terminal.
 
 ## Install (once per machine)
 
@@ -37,8 +27,9 @@ phase-loop init        # creates loop.config.json + .gitignore entries
 
 Edit `loop.config.json`:
 - `verify` → the checks that gate every phase (`bun run typecheck`, `pnpm test`, …). **The most important setting.**
-- `agentCmd` → add your model, e.g. `["omp", "-p", "--yolo", "--no-session", "--model", "anthropic/claude-opus-5-5"]`.
-  Windows: if `omp` is a `.cmd` shim, use `["cmd", "/c", "omp", ...]`.
+- `model` / `thinking` → the model every phase session uses (e.g. `anthropic/claude-opus-5-5`, thinking `high`).
+  Leave `model` empty to use omp's default model role (whatever `/model` is set to in omp).
+- `agentCmd` → the base command. Windows: if `omp` is a `.cmd` shim, use `["cmd", "/c", "omp", ...]`.
 - `ntfyTopic` → a random string; subscribe to it in the ntfy phone app for done / failed / blocked pushes.
 - `phaseTimeoutMin`, `maxAttempts` as needed.
 
@@ -52,9 +43,10 @@ Want a project-specific prompt? `phase-loop init --with-prompt` copies `phase-pr
 /phase-loop start @apps/ui/specs/plan.md --from 11 --to 15
 ```
 
-The loop starts in the background and a **live panel** appears above the editor: progress, current phase,
-attempt, elapsed time and the latest agent output (refreshed every 2 s), plus a footer status and a toast
-whenever a phase starts or the run ends. You can keep using omp meanwhile.
+The loop starts in the background and a **live panel** appears above the editor: one row per phase with a
+progress bar, the current stage (agent working / verifying / committing), retries, the model, and the latest
+output (refreshed every second), plus a footer status and a toast whenever a phase starts or the run ends.
+You can keep using omp meanwhile.
 
 - `/phase-loop watch` — show the panel again (e.g. after restarting omp) · `/phase-loop unwatch` — hide it
 - `/phase-loop status` · `/phase-loop stop` · `/phase-loop stop --now` · `/phase-loop list <plan>` · `/phase-loop init`
@@ -64,7 +56,8 @@ whenever a phase starts or the run ends. You can keep using omp meanwhile.
 
 ```sh
 phase-loop start plan.md --from 11 --to 15 --watch   # start in background and follow live
-phase-loop watch                   # follow a run that's already going (Ctrl+C stops watching only)
+phase-loop watch                   # live dashboard: one row + bar per phase (Ctrl+C stops watching only)
+phase-loop watch --raw             # plain log stream instead (also used when output isn't a terminal)
 phase-loop status                  # progress, current phase, recent output
 phase-loop stop                    # stop after the current phase
 phase-loop stop --now              # kill the current phase immediately
@@ -75,6 +68,25 @@ phase-loop run plan.md --dry-run   # print the prompt the first phase will get
 
 Options for `start` / `run`: `--from 3`, `--to 5`, `--only 4`, `--force` (re-run completed phases), `--config file`.
 Starting again after a stop or failure resumes from the first unfinished phase.
+
+### About the progress bars
+
+An agent can't report how far through a phase it is, so the bar is an **estimate**: elapsed time against the
+average duration of the phases already finished in this run (capped at 95% until the phase really completes).
+Until the first phase finishes there is no estimate, so the bar shows a moving block instead.
+The stage label and done / retry / failed markers are exact.
+
+## Which model runs each phase
+
+Precedence, highest first:
+1. a tag inside the phase in your plan: `<!-- model: anthropic/claude-sonnet-5-5 -->` (and optionally `<!-- thinking: low -->`)
+2. `--model <provider/model>` / `--thinking <level>` on `start` / `run`
+3. `model` / `thinking` in `loop.config.json`
+4. omp's default model role
+
+Good use: Opus for architecture-heavy phases, a tag on mechanical phases to run them on Sonnet.
+You can always see it: `list` shows the model each pending phase will get, and the log line, `status`
+and the omp panel show the model of the running phase; `status` also records it per completed phase.
 
 ## Plan format
 

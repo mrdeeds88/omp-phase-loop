@@ -29,14 +29,15 @@ const USAGE = `phase-loop — run a plan phase by phase, one fresh omp session p
 
   phase-loop start <plan.md> [opts]   run in the background (survives closing the terminal or omp)
   phase-loop run <plan.md> [opts]     run in the foreground
-  phase-loop watch                    follow a background run live (Ctrl+C stops watching, not the loop)
+  phase-loop watch [--raw]            live dashboard of a background run (--raw: plain log stream)
   phase-loop status                   progress, current phase, recent output
   phase-loop stop [--now]             stop after the current phase (--now: kill it immediately)
   phase-loop list <plan.md>           show the phases parsed from the plan
   phase-loop init [--with-prompt]     add loop.config.json (and an editable prompt) to this project
   phase-loop setup [--no-extension]   install the global \`phase-loop\` command and the omp /phase-loop command
 
-Options: --from <id>  --to <id>  --only <id>  --force  --dry-run  --config <file>  --watch (with start)`;
+Options: --from <id>  --to <id>  --only <id>  --force  --dry-run  --config <file>  --watch (with start)
+         --model <provider/model>  --thinking <level>   (override the model for this run)`;
 
 // ---------- types & config ----------
 type Config = {
@@ -48,6 +49,8 @@ type Config = {
   gitCommit: boolean;
   requireCleanTree: boolean;
   ntfyTopic?: string;
+  model?: string; // e.g. "anthropic/claude-opus-5-5"; empty = omp's default model role
+  thinking?: string; // omp --thinking level, e.g. "high"
   promptTemplate?: string; // relative to the config file; default: the package template
   handoffMaxChars: number;
 };
@@ -62,8 +65,9 @@ const DEFAULTS: Config = {
   requireCleanTree: true,
   handoffMaxChars: 12000,
 };
-type Phase = { id: string; title: string; body: string };
+type Phase = { id: string; title: string; body: string; model?: string; thinking?: string };
 type Status = "running" | "done" | "failed" | "blocked" | "stopped";
+type Stage = "agent" | "verify" | "commit";
 type State = {
   plan: string;
   status?: Status;
@@ -71,8 +75,9 @@ type State = {
   lastMessage?: string;
   phases?: { id: string; title: string }[];
   selected?: string[];
-  current?: { id: string; title: string; attempt: number; maxAttempts?: number; startedAt: string; agentPid?: number };
-  completed: Record<string, { at: string; commit?: string; summary: string }>;
+  current?: { id: string; title: string; attempt: number; maxAttempts?: number; startedAt: string; phaseStartedAt?: string; stage?: Stage; stageDetail?: string; agentPid?: number; model?: string };
+  failedPhase?: { id: string; kind: "failed" | "blocked" };
+  completed: Record<string, { at: string; commit?: string; summary: string; model?: string; durationMs?: number; attempts?: number }>;
 };
 type Ctx = { opts: Record<string, string | boolean>; planPath: string; planRel: string; configPath?: string; cfg: Config; templatePath: string; phases: Phase[] };
 
@@ -92,7 +97,7 @@ function parseArgs(a: string[]) {
   for (let i = 0; i < a.length; i++) {
     if (a[i].startsWith("--")) {
       const key = a[i].slice(2);
-      if (["config", "from", "to", "only"].includes(key) && a[i + 1] !== undefined) opts[key] = a[++i];
+      if (["config", "from", "to", "only", "model", "thinking"].includes(key) && a[i + 1] !== undefined) opts[key] = a[++i];
       else opts[key] = true;
     } else positional.push(a[i]);
   }
@@ -162,7 +167,12 @@ function parsePhases(md: string, heading: string): Phase[] {
     if (cur && h && h[1].length <= cur.level) cur = null; // a non-phase heading at same/higher level ends the phase
     if (cur) cur.lines.push(line);
   }
-  return out.map(({ id, title, lines }) => ({ id, title, body: lines.join("\n").trim() }));
+  // optional per-phase overrides inside the phase body: <!-- model: anthropic/claude-sonnet-5-5 -->  <!-- thinking: low -->
+  const tag = (body: string, key: string) => body.match(new RegExp(`<!--\\s*${key}\\s*:\\s*([^\\s>]+)\\s*-->`, "i"))?.[1];
+  return out.map(({ id, title, lines }) => {
+    const body = lines.join("\n").trim();
+    return { id, title, body, model: tag(body, "model"), thinking: tag(body, "thinking") };
+  });
 }
 
 /**
@@ -226,7 +236,29 @@ async function preflight(cfg: Config) {
 }
 
 function printPhases(ctx: Ctx, state: State, pending: Phase[]) {
-  for (const p of ctx.phases) console.log(`${state.completed[p.id] ? "✔" : pending.includes(p) ? "•" : " "} ${p.id}: ${p.title}`);
+  for (const p of ctx.phases) {
+    const m = pending.includes(p) ? `  [${agentInvocation(ctx, p).model}]` : "";
+    console.log(`${state.completed[p.id] ? "✔" : pending.includes(p) ? "•" : " "} ${p.id}: ${p.title}${m}`);
+  }
+}
+
+// ---------- model ----------
+/** Precedence: phase tag > --model flag > config "model" > --model already in agentCmd > omp's default model role. */
+function agentInvocation(ctx: Ctx, ph: Phase): { cmd: string[]; model: string; thinking?: string } {
+  const base = [...ctx.cfg.agentCmd];
+  const take = (flag: string) => {
+    const i = base.indexOf(flag);
+    if (i < 0) return undefined;
+    const v = base[i + 1];
+    base.splice(i, 2);
+    return v;
+  };
+  const cmdModel = take("--model");
+  const cmdThinking = take("--thinking");
+  const model = ph.model || (ctx.opts.model as string) || ctx.cfg.model || cmdModel;
+  const thinking = ph.thinking || (ctx.opts.thinking as string) || ctx.cfg.thinking || cmdThinking;
+  const cmd = [...base, ...(model ? ["--model", model] : []), ...(thinking ? ["--thinking", thinking] : [])];
+  return { cmd, model: model ? `${model}${thinking ? ` (thinking: ${thinking})` : ""}` : `omp default model${thinking ? ` (thinking: ${thinking})` : ""}`, thinking };
 }
 
 // ---------- prompt ----------
@@ -309,11 +341,18 @@ async function cmdRun(args: string[]) {
   state.selected = pending.map((p) => p.id);
   state.status = "running";
   state.lastMessage = undefined;
+  delete state.failedPhase;
   writeState(state);
+  const setStage = (stage: Stage, detail?: string) => {
+    if (!state.current) return;
+    state.current.stage = stage;
+    state.current.stageDetail = detail;
+    writeState(state);
+  };
 
-  const runAgent = (promptFile: string, logFile: string) =>
+  const runAgent = (agentCmd: string[], promptFile: string, logFile: string) =>
     new Promise<{ code: number; timedOut: boolean }>((done) => {
-      const cmd = [...cfg.agentCmd, `@${rel(promptFile)}`, "Follow the instructions in the attached file exactly."];
+      const cmd = [...agentCmd, `@${rel(promptFile)}`, "Follow the instructions in the attached file exactly."];
       writeFileSync(logFile, `$ ${cmd.join(" ")}\n\n`);
       // detached on POSIX = own process group, so a timeout/stop kills the agent and every shell it started
       child = spawn(cmd[0], cmd.slice(1), { cwd: root, stdio: ["ignore", "pipe", "pipe"], detached: !isWin, windowsHide: true });
@@ -356,16 +395,20 @@ async function cmdRun(args: string[]) {
 
     const resultPath = join(P.results, `phase-${ph.id}.json`);
     let retryContext = "";
+    const phaseStartedAt = new Date().toISOString();
+    let attemptsUsed = 0;
     let result: { status: "done" | "blocked"; summary?: string; handoff?: string; blockedReason?: string } | null = null;
 
     for (let attempt = 1; attempt <= cfg.maxAttempts; attempt++) {
-      log(`Phase ${ph.id} "${ph.title}" — attempt ${attempt}/${cfg.maxAttempts} (fresh session)`);
-      state.current = { id: ph.id, title: ph.title, attempt, maxAttempts: cfg.maxAttempts, startedAt: new Date().toISOString() };
+      const inv = agentInvocation(ctx, ph);
+      log(`Phase ${ph.id} "${ph.title}" — attempt ${attempt}/${cfg.maxAttempts} (fresh session) · model: ${inv.model}`);
+      attemptsUsed = attempt;
+      state.current = { id: ph.id, title: ph.title, attempt, maxAttempts: cfg.maxAttempts, startedAt: new Date().toISOString(), phaseStartedAt, stage: "agent", model: inv.model };
       writeState(state);
       rmSync(resultPath, { force: true });
       const promptFile = join(P.prompts, `phase-${ph.id}.md`);
       writeFileSync(promptFile, buildPrompt(ctx, state, ph, resultPath, retryContext));
-      const { code, timedOut } = await runAgent(promptFile, join(P.logs, `phase-${ph.id}-attempt-${attempt}.log`));
+      const { code, timedOut } = await runAgent(inv.cmd, promptFile, join(P.logs, `phase-${ph.id}-attempt-${attempt}.log`));
 
       try {
         const r = existsSync(resultPath) ? JSON.parse(readFileSync(resultPath, "utf8")) : null;
@@ -382,6 +425,7 @@ async function cmdRun(args: string[]) {
         continue;
       }
       if (result.status === "blocked") {
+        state.failedPhase = { id: ph.id, kind: "blocked" };
         await notify(cfg, `Phase ${ph.id} BLOCKED`, result.blockedReason || result.summary || "no reason given", "high");
         finish("blocked", 2, `Phase ${ph.id} blocked: ${result.blockedReason || result.summary || "no reason given"}`);
       }
@@ -390,6 +434,7 @@ async function cmdRun(args: string[]) {
       let failed = "";
       for (const v of cfg.verify) {
         log(`verify: ${v}`);
+        setStage("verify", v);
         const r = await run(shellArgv(v));
         if (r.code !== 0) {
           failed = `\`${v}\` failed (exit ${r.code}):\n\n\`\`\`\n${tail(r.out)}\n\`\`\``;
@@ -405,6 +450,7 @@ async function cmdRun(args: string[]) {
     }
 
     if (!result) {
+      state.failedPhase = { id: ph.id, kind: "failed" };
       await notify(cfg, `Phase ${ph.id} FAILED`, `Gave up after ${cfg.maxAttempts} attempts. See .loop/logs/`, "high");
       finish("failed", 1, `Phase ${ph.id} failed after ${cfg.maxAttempts} attempts`);
     }
@@ -412,13 +458,14 @@ async function cmdRun(args: string[]) {
     appendFileSync(P.handoff, `\n## Phase ${ph.id} — ${ph.title} (${new Date().toISOString()})\n\n**Summary:** ${result.summary ?? ""}\n\n${result.handoff ?? ""}\n`);
 
     let commit: string | undefined;
+    setStage("commit");
     if (cfg.gitCommit) {
       await git("add", "-A", "--", ".", ":!.loop/logs", ":!.loop/prompts", ":!.loop/runner.*", ":!.loop/STOP", ":!.loop/state.json");
       const c = await git("commit", "-m", `phase ${ph.id}: ${ph.title}`, "-m", result.summary ?? "", "--no-verify");
       if (c.code === 0) commit = (await git("rev-parse", "--short", "HEAD")).out.trim();
       else log(`git commit skipped: ${c.out.trim().split("\n").pop()}`);
     }
-    state.completed[ph.id] = { at: new Date().toISOString(), commit, summary: result.summary ?? "" };
+    state.completed[ph.id] = { at: new Date().toISOString(), commit, summary: result.summary ?? "", model: agentInvocation(ctx, ph).model, durationMs: Date.now() - Date.parse(phaseStartedAt), attempts: attemptsUsed };
     writeState(state);
     await notify(cfg, `Phase ${ph.id} done`, `${ph.title}${commit ? ` (${commit})` : ""}`, "low");
   }
@@ -451,12 +498,20 @@ async function cmdStart(args: string[]) {
     `Started in the background (pid ${child.pid}): ${pending.length} phase(s) — ${pending.map((p) => p.id).join(", ")}\n` +
       `Watch: phase-loop watch · Status: phase-loop status · Stop: phase-loop stop [--now]`,
   );
-  if (ctx.opts.watch) await cmdWatch();
+  if (ctx.opts.watch) await cmdWatch(args);
 }
 
 /** Follow the background run live (Ctrl+C only stops watching; the loop keeps running). */
-async function cmdWatch() {
-  if (!existsSync(P.runnerLog)) return console.log("Nothing to watch yet: no background run in this folder (.loop/runner.log not found).");
+async function cmdWatch(args: string[] = []) {
+  const { opts } = parseArgs(args);
+  if (!existsSync(P.state) && !existsSync(P.runnerLog))
+    return console.log("Nothing to watch yet: no phase-loop run in this folder.");
+  if (opts.raw || !process.stdout.isTTY) return watchRaw();
+  return watchDashboard();
+}
+
+async function watchRaw() {
+  if (!existsSync(P.runnerLog)) return console.log("No background log yet (.loop/runner.log not found).");
   const initial = tailFile(P.runnerLog, 20);
   if (initial) console.log(initial);
   let pos = statSync(P.runnerLog).size;
@@ -488,6 +543,161 @@ async function cmdWatch() {
   console.log(`\n[phase-loop] runner exited — status: ${s?.status ?? "unknown"}${s?.lastMessage ? ` (${s.lastMessage})` : ""}`);
 }
 
+// ---------- dashboard ----------
+const C = {
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+  amber: "\x1b[38;5;214m", green: "\x1b[38;5;78m", red: "\x1b[38;5;203m", grey: "\x1b[38;5;244m", faint: "\x1b[38;5;239m",
+};
+const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+const vlen = (s: string) => [...stripAnsi(s)].length;
+function fit(s: string, w: number) {
+  // truncate a plain string to w columns
+  const chars = [...s];
+  return chars.length > w ? chars.slice(0, Math.max(0, w - 1)).join("") + "…" : s;
+}
+const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - vlen(s)));
+function fmtDur(ms: number) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+function bar(width: number, frac: number | null, color: string, tick: number) {
+  if (frac === null) {
+    // indeterminate: a block sweeping back and forth
+    const blk = Math.max(3, Math.round(width / 5));
+    const span = width - blk;
+    const pos = span <= 0 ? 0 : Math.abs(((tick % (span * 2)) + span * 2) % (span * 2) - span);
+    const p0 = span - pos;
+    return C.faint + "━".repeat(p0) + color + "━".repeat(blk) + C.faint + "━".repeat(Math.max(0, width - p0 - blk)) + C.reset;
+  }
+  const full = Math.round(Math.min(1, Math.max(0, frac)) * width);
+  return color + "━".repeat(full) + C.faint + "━".repeat(width - full) + C.reset;
+}
+
+function renderDashboard(tick: number): string[] {
+  const cols = Math.max(60, process.stdout.columns || 100);
+  const rows = Math.max(20, process.stdout.rows || 30);
+  const s = readState();
+  const pid = runningPid();
+  const out: string[] = [];
+  if (!s) return [`${C.amber}phase-loop${C.reset}  waiting for the runner to start…`];
+
+  const phases = s.phases ?? [];
+  const sel = s.selected?.length ? s.selected : phases.map((p) => p.id);
+  const byId = new Map(phases.map((p) => [p.id, p]));
+  const done = sel.filter((id) => s.completed[id]).length;
+  const durations = sel.map((id) => s.completed[id]?.durationMs).filter((d): d is number => !!d);
+  const avg = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null;
+  const cur = pid ? s.current : undefined;
+
+  const statusTxt = pid
+    ? `${C.green}● running${C.reset}`
+    : s.status === "done" ? `${C.green}✓ done${C.reset}`
+    : s.status === "running" ? `${C.red}✗ runner died — phase-loop start to resume${C.reset}`
+    : s.status === "failed" || s.status === "blocked" ? `${C.red}✗ ${s.status}${C.reset}`
+    : `${C.grey}■ ${s.status ?? "stopped"}${C.reset}`;
+  out.push(`${C.bold}${C.amber}phase-loop${C.reset}  ${C.grey}${s.plan}${C.reset}   ${statusTxt}   ${C.bold}${done}/${sel.length}${C.reset}${C.grey} done${C.reset}`);
+  out.push(C.faint + "─".repeat(cols) + C.reset);
+
+  // phase rows (window around the current phase if the list is long)
+  const maxRows = Math.max(4, rows - 14);
+  let ids = sel;
+  if (ids.length > maxRows) {
+    const ci = Math.max(0, cur ? ids.indexOf(cur.id) : ids.findIndex((id) => !s.completed[id]));
+    const startI = Math.min(Math.max(0, ci - Math.floor(maxRows / 2)), ids.length - maxRows);
+    ids = ids.slice(startI, startI + maxRows);
+    if (startI > 0) out.push(`${C.grey}  … ${startI} earlier${C.reset}`);
+  }
+  const idW = Math.max(...sel.map((id) => id.length)) + 6; // "Phase " + id
+  const barW = Math.max(12, Math.min(30, Math.floor(cols * 0.22)));
+  const infoW = 34;
+  const longest = Math.max(10, ...sel.map((id) => [...(byId.get(id)?.title ?? "")].length));
+  const titleW = Math.max(10, Math.min(longest, cols - 4 - idW - 2 - barW - 2 - infoW));
+
+  for (const id of ids) {
+    const ph = byId.get(id);
+    const c = s.completed[id];
+    const isCur = cur?.id === id;
+    const failed = !pid && s.failedPhase?.id === id ? s.failedPhase.kind : undefined;
+    let icon: string, color: string, frac: number | null, info: string;
+    if (c) {
+      icon = `${C.green}✓${C.reset}`; color = C.green; frac = 1;
+      info = `${C.green}done${C.reset}${C.grey}${c.durationMs ? ` ${fmtDur(c.durationMs)}` : ""}${c.commit ? ` · ${c.commit}` : ""}${c.attempts && c.attempts > 1 ? ` · ${c.attempts} tries` : ""}${C.reset}`;
+    } else if (isCur && cur) {
+      icon = `${C.amber}${SPIN[tick % SPIN.length]}${C.reset}`; color = C.amber;
+      const el = Date.now() - Date.parse(cur.phaseStartedAt ?? cur.startedAt);
+      frac = avg ? Math.min(0.95, el / avg) : null;
+      const stage = cur.stage === "verify" ? "verifying" : cur.stage === "commit" ? "committing" : "agent working";
+      const tries = cur.attempt > 1 ? `${C.red} · retry ${cur.attempt}/${cur.maxAttempts}${C.reset}` : `${C.grey} · try 1/${cur.maxAttempts ?? 1}${C.reset}`;
+      info = `${C.amber}${stage}${C.reset}${C.grey} ${fmtDur(el)}${avg ? ` / ~${fmtDur(avg)}` : ""}${C.reset}${tries}`;
+    } else if (failed) {
+      icon = `${C.red}✗${C.reset}`; color = C.red; frac = 0;
+      info = `${C.red}${failed}${C.reset}`;
+    } else {
+      icon = `${C.faint}•${C.reset}`; color = C.faint; frac = 0;
+      info = `${C.faint}queued${C.reset}`;
+    }
+    const idTxt = isCur ? `${C.bold}Phase ${id}${C.reset}` : `${c ? C.grey : ""}Phase ${id}${C.reset}`;
+    const title = fit(ph?.title ?? "", titleW);
+    const titleTxt = isCur ? `${C.bold}${title}${C.reset}` : c ? `${C.grey}${title}${C.reset}` : title;
+    out.push(`  ${icon} ${pad(idTxt, idW)}  ${pad(titleTxt, titleW)}  ${bar(barW, frac, color, tick)}  ${info}`);
+  }
+
+  // current phase details
+  out.push("");
+  if (cur) {
+    const detail = cur.stage === "verify" && cur.stageDetail ? `verify: ${cur.stageDetail}` : cur.stage === "commit" ? "git commit + handoff notes" : "fresh omp session";
+    out.push(`${C.grey}  model ${C.reset}${cur.model ?? "?"}${C.grey}   ·   ${detail}${avg ? "   ·   bar = elapsed vs. average phase time" : "   ·   no estimate until a phase completes"}${C.reset}`);
+  } else if (s.lastMessage) out.push(`  ${s.lastMessage}`);
+
+  // recent output fills the rest
+  out.push(C.faint + "─".repeat(cols) + C.reset);
+  const room = Math.max(3, rows - out.length - 2);
+  for (const l of tailFile(P.runnerLog, 200).split(/\r?\n/).map(stripAnsi).filter((l) => l.trim()).slice(-room)) {
+    const line = fit(l, cols - 2);
+    out.push(l.startsWith("[phase-loop") ? `${C.grey}${line}${C.reset}` : `${C.dim}${line}${C.reset}`);
+  }
+  while (out.length < rows - 1) out.push("");
+  out.push(`${C.faint}Ctrl+C stops watching (the loop keeps running) · phase-loop stop [--now] to stop it${C.reset}`);
+  return out.slice(0, rows);
+}
+
+async function watchDashboard() {
+  const w = process.stdout;
+  let alive = true;
+  const restore = (msg?: string) => {
+    if (!alive) return;
+    alive = false;
+    w.write("\x1b[?25h\x1b[?1049l"); // show cursor, leave alternate screen
+    if (msg) console.log(msg);
+  };
+  process.on("SIGINT", () => {
+    restore("(stopped watching — the loop keeps running; `phase-loop stop` to stop it)");
+    process.exit(0);
+  });
+  process.on("exit", () => restore());
+  w.write("\x1b[?1049h\x1b[?25l"); // alternate screen, hide cursor
+  let tick = 0;
+  let sawRunner = !!runningPid();
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    const lines = renderDashboard(tick++);
+    w.write("\x1b[H" + lines.map((l) => l + "\x1b[K").join("\n") + "\x1b[J");
+    const pid = runningPid();
+    if (pid) sawRunner = true;
+    if (!pid && (sawRunner || Date.now() > deadline)) break;
+    await Bun.sleep(250);
+  }
+  await Bun.sleep(600);
+  const final = renderDashboard(0).filter((l, i, a) => i < a.length - 1 && stripAnsi(l).trim() !== "");
+  restore();
+  console.log(final.join("\n"));
+}
+
 function cmdStatus() {
   const s = readState();
   if (!s) return console.log("No phase-loop run in this folder yet (.loop/state.json not found).");
@@ -504,11 +714,11 @@ function cmdStatus() {
   for (const p of phases) {
     const c = s.completed[p.id];
     const mark = c ? "✔" : pid && s.current?.id === p.id ? "▶" : "•";
-    out.push(`  ${mark} ${p.id}: ${p.title}${c?.commit ? ` (${c.commit})` : ""}`);
+    out.push(`  ${mark} ${p.id}: ${p.title}${c?.commit ? ` (${c.commit})` : ""}${c?.model ? ` · ${c.model}` : ""}`);
   }
   if (pid && s.current) {
     const mins = Math.round((Date.now() - Date.parse(s.current.startedAt)) / 60000);
-    out.push(`Current: phase ${s.current.id}, attempt ${s.current.attempt}, running ${mins} min`);
+    out.push(`Current: phase ${s.current.id}, attempt ${s.current.attempt}, running ${mins} min${s.current.model ? ` · model: ${s.current.model}` : ""}`);
   }
   if (s.lastMessage) out.push(`Last: ${s.lastMessage}`);
   if (existsSync(P.stop)) out.push("Stop requested: will stop after the current phase.");
@@ -613,7 +823,7 @@ switch (sub) {
   case "run": await cmdRun(rest); break;
   case "start": await cmdStart(rest); break;
   case "status": cmdStatus(); break;
-  case "watch": case "logs": await cmdWatch(); break;
+  case "watch": case "logs": await cmdWatch(rest); break;
   case "stop": await cmdStop(rest); break;
   case "list": cmdList(rest); break;
   case "init": cmdInit(rest); break;

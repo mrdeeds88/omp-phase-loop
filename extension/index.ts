@@ -22,7 +22,7 @@ const CLI_SUBCOMMANDS = ["start", "status", "stop", "list", "init"];
 const USAGE =
   "Usage: /phase-loop start <plan.md> [--from id] [--to id] [--only id] [--force] [--no-watch] | watch | unwatch | status | stop [--now] | list <plan.md> | init";
 const WIDGET = "phase-loop";
-const OUTPUT_LINES = 8;
+const OUTPUT_LINES = 5;
 
 // ---------- helpers ----------
 function splitArgs(s: string): string[] {
@@ -78,8 +78,27 @@ function tailLines(p: string, n: number): string[] {
   }
 }
 
+// ---------- bars ----------
+const PHASE_ROWS = 6;
+const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+function fmtDur(ms: number) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+/** frac in 0..1, or -1 for "no estimate yet" (a moving block) */
+function bar(width: number, frac: number, tick: number) {
+  if (frac < 0) {
+    const blk = 4, span = width - blk, pos = Math.abs((tick % (span * 2)) - span), p0 = span - pos;
+    return "─".repeat(p0) + "━".repeat(blk) + "─".repeat(width - p0 - blk);
+  }
+  const full = Math.round(Math.min(1, Math.max(0, frac)) * width);
+  return "━".repeat(full) + "─".repeat(width - full);
+}
+
 // ---------- live watcher ----------
-type Watcher = { ctx: any; cwd: string; timer: any; lastKey?: string; sawRunner: boolean; startedAt: number };
+type Watcher = { ctx: any; cwd: string; timer: any; lastKey?: string; sawRunner: boolean; startedAt: number; tick: number };
 let watcher: Watcher | null = null;
 
 function clearTimerSafe(w: Watcher) {
@@ -101,6 +120,7 @@ function stopWatch(final = false) {
 }
 
 function render(w: Watcher) {
+  w.tick++;
   const loop = join(w.cwd, ".loop");
   const s = readJson(join(loop, "state.json"));
   const pid = runnerPid(w.cwd);
@@ -117,13 +137,43 @@ function render(w: Watcher) {
   const cur = pid ? s.current : undefined;
   const state = pid ? "running" : s.status === "running" ? "runner died — /phase-loop start to resume" : (s.status ?? "stopped");
 
-  const lines = [`phase-loop · ${basename(s.plan)} · ${state} · ${done}/${sel.length} done`];
-  if (cur) {
-    const mins = Math.max(0, Math.round((Date.now() - Date.parse(cur.startedAt)) / 60000));
-    lines.push(`▶ Phase ${cur.id}: ${cur.title} — attempt ${cur.attempt}/${cur.maxAttempts ?? "?"} · ${mins} min`);
-  } else if (s.lastMessage) lines.push(s.lastMessage);
+  const lines = [`phase-loop · ${basename(s.plan)} · ${state} · ${done}/${sel.length} done${cur?.model ? ` · ${cur.model}` : ""}`];
+
+  // one row per phase with a bar (window of PHASE_ROWS around the current phase)
+  const titles = new Map<string, string>((s.phases ?? []).map((p: any) => [p.id, p.title]));
+  const durs = sel.map((id) => s.completed?.[id]?.durationMs).filter((d: any) => typeof d === "number") as number[];
+  const avg = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null;
+  let ids = sel;
+  if (ids.length > PHASE_ROWS) {
+    const ci = Math.max(0, cur ? ids.indexOf(cur.id) : ids.findIndex((id) => !s.completed?.[id]));
+    const st = Math.min(Math.max(0, ci - 2), ids.length - PHASE_ROWS);
+    ids = ids.slice(st, st + PHASE_ROWS);
+  }
+  const idW = Math.max(...sel.map((id) => id.length));
+  const tW = Math.min(28, Math.max(8, ...ids.map((id) => (titles.get(id) ?? "").length)));
+  const fit = (t: string) => (t.length > tW ? t.slice(0, tW - 1) + "…" : t.padEnd(tW));
+  for (const id of ids) {
+    const c = s.completed?.[id];
+    const isCur = cur?.id === id;
+    let icon = "·", frac = 0, info = "queued";
+    if (c) {
+      icon = "✓"; frac = 1;
+      info = `done${c.durationMs ? ` ${fmtDur(c.durationMs)}` : ""}${c.commit ? ` · ${c.commit}` : ""}`;
+    } else if (isCur) {
+      icon = SPIN[w.tick % SPIN.length];
+      const el = Date.now() - Date.parse(cur.phaseStartedAt ?? cur.startedAt);
+      frac = avg ? Math.min(0.95, el / avg) : -1;
+      const stage = cur.stage === "verify" ? "verifying" : cur.stage === "commit" ? "committing" : "agent working";
+      info = `${stage} ${fmtDur(el)}${avg ? ` / ~${fmtDur(avg)}` : ""}${cur.attempt > 1 ? ` · RETRY ${cur.attempt}/${cur.maxAttempts}` : ""}`;
+    } else if (!pid && s.failedPhase?.id === id) {
+      icon = "✗"; info = s.failedPhase.kind;
+    }
+    lines.push(`${icon} ${String(id).padStart(idW)}  ${fit(titles.get(id) ?? "")}  ${bar(18, frac, w.tick)}  ${info}`);
+  }
+  if (!cur && s.lastMessage) lines.push(s.lastMessage);
+
   const out = tailLines(join(loop, "runner.log"), OUTPUT_LINES).map((l) => "  " + (l.length > 140 ? l.slice(0, 139) + "…" : l));
-  if (out.length) lines.push(...out);
+  if (out.length) lines.push("", ...out);
 
   w.ctx.ui?.setWidget?.(WIDGET, lines);
   w.ctx.ui?.setStatus?.(WIDGET, cur ? `loop ▶ ${cur.id} · ${done}/${sel.length}` : pid ? `loop ${done}/${sel.length}` : undefined);
@@ -150,11 +200,11 @@ function startWatch(ctx: any, announce: boolean) {
     return;
   }
   stopWatch();
-  const w: Watcher = { ctx, cwd, timer: undefined, sawRunner: false, startedAt: Date.now() };
+  const w: Watcher = { ctx, cwd, timer: undefined, sawRunner: false, startedAt: Date.now(), tick: 0 };
   const tick = () => {
     if (watcher === w) render(w);
   };
-  w.timer = ctx.setInterval ? ctx.setInterval(tick, 2000) : setInterval(tick, 2000);
+  w.timer = ctx.setInterval ? ctx.setInterval(tick, 1000) : setInterval(tick, 1000);
   watcher = w;
   render(w);
   if (announce)
