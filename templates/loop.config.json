@@ -1,0 +1,9 @@
+{
+  "agentCmd": ["omp", "-p", "--yolo", "--no-session"],
+  "verify": ["bun run typecheck", "bun test"],
+  "maxAttempts": 3,
+  "phaseTimeoutMin": 90,
+  "gitCommit": true,
+  "requireCleanTree": true,
+  "ntfyTopic": ""
+}

@@ -1,0 +1,9 @@
+{
+  "name": "phase-loop",
+  "version": "0.2.0",
+  "description": "Run a multi-phase plan with Oh My Pi, one fresh session per phase, unattended.",
+  "type": "module",
+  "bin": { "phase-loop": "bin/phase-loop.ts" },
+  "omp": { "extensions": ["./extension/index.ts"] },
+  "engines": { "bun": ">=1.1" }
+}
