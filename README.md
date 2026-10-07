@@ -1,6 +1,16 @@
 # phase-loop
 
-Run a multi-phase plan with **Oh My Pi**, unattended: every phase gets a **fresh `omp -p` session** (your manual "/clear, then do the next task"), the runner checks the work itself, commits, and moves on. It runs as a background process, so it keeps going after you close omp or the terminal.
+**Run a long plan phase by phase, with no one watching.**
+
+A big plan is too much for one agent session. The context fills up and the model loses track. So you split the plan into phases and do one per session: start a new session, paste in the next phase, wait, check the work, commit, and do it again. That's slow, and someone has to sit there the whole time.
+
+phase-loop does those steps for you with **Oh My Pi**. Point it at your `plan.md` and it gives each phase its own fresh `omp -p` session. After each phase it runs your verify commands (typecheck, tests). If they fail, it opens a new session with the errors so the agent can fix them. When they pass, it commits and moves on to the next phase. Notes are carried from one phase to the next in `.loop/HANDOFF.md`, so each session knows what the earlier ones did.
+
+It runs in the background, so you can close omp or the terminal and it keeps going. Follow it from a live `/phase-loop` panel in omp or with `phase-loop watch`, and get phone alerts through ntfy when the run finishes, fails, or needs a human.
+
+```
+/phase-loop start @specs/plan.md --from 1 --to 8
+```
 
 ## Install (once per machine)
 
