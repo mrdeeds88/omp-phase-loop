@@ -152,21 +152,27 @@ const git = (...a: string[]) => run(["git", ...a]);
 // ---------- plan & config ----------
 function parsePhases(md: string, heading: string): Phase[] {
   const re = new RegExp(heading, "iu");
+  const lines = md.split(/\r?\n/);
+  // Match each line once, skipping code fences; null = fenced or not a heading.
+  let inFence = false;
+  const scanned = lines.map((line) => {
+    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
+    return inFence ? null : { phase: line.match(re)?.groups, hashes: line.match(/^(#{1,6})\s/)?.[1].length };
+  });
+  // Only the outermost matching level is a phase: "## Phase 1" wins and its nested "### Task 1..3" stay in its body.
+  const top = Math.min(...scanned.flatMap((s) => (s?.phase ? [s.phase.hashes.length] : [])));
   const out: (Phase & { level: number; lines: string[] })[] = [];
   let cur: (typeof out)[number] | null = null;
-  let inFence = false;
-  for (const line of md.split(/\r?\n/)) {
-    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
-    const m = inFence ? null : line.match(re);
-    if (m?.groups) {
-      cur = { id: m.groups.id, title: (m.groups.title ?? "").trim(), body: "", level: m.groups.hashes.length, lines: [line] };
+  lines.forEach((line, i) => {
+    const s = scanned[i];
+    if (s?.phase && s.phase.hashes.length === top) {
+      cur = { id: s.phase.id, title: (s.phase.title ?? "").trim(), body: "", level: top, lines: [line] };
       out.push(cur);
-      continue;
+      return;
     }
-    const h = inFence ? null : line.match(/^(#{1,6})\s/);
-    if (cur && h && h[1].length <= cur.level) cur = null; // a non-phase heading at same/higher level ends the phase
+    if (cur && s?.hashes && s.hashes <= cur.level) cur = null; // a non-phase heading at same/higher level ends the phase
     if (cur) cur.lines.push(line);
-  }
+  });
   // optional per-phase overrides inside the phase body: <!-- model: anthropic/claude-sonnet-5-5 -->  <!-- thinking: low -->
   const tag = (body: string, key: string) => body.match(new RegExp(`<!--\\s*${key}\\s*:\\s*([^\\s>]+)\\s*-->`, "i"))?.[1];
   return out.map(({ id, title, lines }) => {

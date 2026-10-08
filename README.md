@@ -92,6 +92,7 @@ and the omp panel show the model of the running phase; `status` also records it 
 
 Phase headings: `## Phase 1: Title`, `### Task 2 — Title`, `## Giai đoạn 3: …`, `## Bước 4: …`.
 A phase runs until the next heading of the same or higher level. Headings inside code fences are ignored.
+When matching headings are nested (`## Phase 1` containing `### Task 1`), only the outermost level counts as phases; nested ones stay in the phase body.
 Best results: give each phase **Goal / Scope / Acceptance criteria**.
 
 ## What happens per phase
