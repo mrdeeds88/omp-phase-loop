@@ -87,14 +87,20 @@ function fmtDur(ms: number) {
   const m = Math.floor(s / 60);
   return m < 60 ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
 }
-/** frac in 0..1, or -1 for "no estimate yet" (a moving block) */
-function bar(width: number, frac: number, tick: number) {
+/** The slice of omp's `ctx.ui.theme` this widget uses. */
+type WidgetTheme = { fg?(color: string, text: string): string } | undefined;
+/** Theme color when the host provides one (interactive omp); plain text otherwise (RPC clients). */
+function tint(theme: WidgetTheme, color: string | undefined, text: string) {
+  return color && theme?.fg ? theme.fg(color, text) : text;
+}
+/** frac in 0..1, or -1 for "no estimate yet" (a moving block); the filled part takes `color` */
+function bar(width: number, frac: number, tick: number, theme: WidgetTheme, color: string | undefined) {
   if (frac < 0) {
     const blk = 4, span = width - blk, pos = Math.abs((tick % (span * 2)) - span), p0 = span - pos;
-    return "─".repeat(p0) + "━".repeat(blk) + "─".repeat(width - p0 - blk);
+    return "─".repeat(p0) + tint(theme, color, "━".repeat(blk)) + "─".repeat(width - p0 - blk);
   }
   const full = Math.round(Math.min(1, Math.max(0, frac)) * width);
-  return "━".repeat(full) + "─".repeat(width - full);
+  return (full ? tint(theme, color, "━".repeat(full)) : "") + "─".repeat(width - full);
 }
 
 // ---------- live watcher ----------
@@ -150,17 +156,18 @@ function render(w: Watcher) {
     ids = ids.slice(st, st + PHASE_ROWS);
   }
   const idW = Math.max(...sel.map((id) => id.length));
+  const theme: WidgetTheme = w.ctx.ui?.theme;
   const tW = Math.min(28, Math.max(8, ...ids.map((id) => (titles.get(id) ?? "").length)));
   const fit = (t: string) => (t.length > tW ? t.slice(0, tW - 1) + "…" : t.padEnd(tW));
   for (const id of ids) {
     const c = s.completed?.[id];
     const isCur = cur?.id === id;
-    let icon = "·", frac = 0, info = "queued";
+    let icon = "·", frac = 0, info = "queued", color: string | undefined;
     if (c) {
-      icon = "✓"; frac = 1;
+      color = "success"; icon = tint(theme, color, "✓"); frac = 1;
       info = `done${c.durationMs ? ` ${fmtDur(c.durationMs)}` : ""}${c.commit ? ` · ${c.commit}` : ""}`;
     } else if (isCur) {
-      icon = SPIN[w.tick % SPIN.length];
+      color = "warning"; icon = tint(theme, color, SPIN[w.tick % SPIN.length]);
       const el = Date.now() - Date.parse(cur.phaseStartedAt ?? cur.startedAt);
       frac = avg ? Math.min(0.95, el / avg) : -1;
       const stage = cur.stage === "verify" ? "verifying" : cur.stage === "commit" ? "committing" : "agent working";
@@ -168,7 +175,7 @@ function render(w: Watcher) {
     } else if (!pid && s.failedPhase?.id === id) {
       icon = "✗"; info = s.failedPhase.kind;
     }
-    lines.push(`${icon} ${String(id).padStart(idW)}  ${fit(titles.get(id) ?? "")}  ${bar(18, frac, w.tick)}  ${info}`);
+    lines.push(`${icon} ${String(id).padStart(idW)}  ${fit(titles.get(id) ?? "")}  ${bar(18, frac, w.tick, theme, color)}  ${info}`);
   }
   if (!cur && s.lastMessage) lines.push(s.lastMessage);
 
